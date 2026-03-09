@@ -137,7 +137,7 @@ End with: what success looks like after completing all 3 steps.`
 async function callAI(commandName, userInput) {
   const prompt = COMMAND_PROMPTS[commandName](userInput);
   const response = await openai.chat.completions.create({
-    model: 'gpt-4',
+    model: 'gpt-3.5-turbo',
     messages: [
       { role: 'system', content: BASE_SYSTEM },
       { role: 'user', content: prompt }
