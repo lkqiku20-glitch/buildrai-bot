@@ -1,7 +1,7 @@
 require('dotenv').config();
 const {
   Client, GatewayIntentBits, REST, Routes,
-  SlashCommandBuilder, Events, EmbedBuilder,
+  SlashCommandBuilder, Events, EmbedBuilder, PermissionFlagsBits,
 } = require('discord.js');
 const Anthropic = require('@anthropic-ai/sdk');
 
@@ -33,12 +33,14 @@ const RANKS = [
   { name: '👑 Empire',   minXP: 15000 },
 ];
 
-// ── In-memory stores ──────────────────────────────────────────────────────────
-const promptCounts  = new Map(); // userId -> { count, date }
-const xpStore       = new Map(); // userId -> xp
-const streakStore   = new Map(); // userId -> { streak, lastDate }
-const xpCooldowns   = new Map(); // userId -> timestamp
-const conversations = new Map(); // userId -> messages[]
+// ── Stores ────────────────────────────────────────────────────────────────────
+const promptCounts  = new Map();
+const xpStore       = new Map();
+const streakStore   = new Map();
+const xpCooldowns   = new Map();
+const conversations = new Map();
+const warnStore     = new Map(); // userId -> [{ reason, modTag, timestamp }]
+const spamTracker   = new Map(); // userId -> [timestamps]
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function today() { return new Date().toISOString().split('T')[0]; }
@@ -60,20 +62,22 @@ function bumpCount(uid) { promptCounts.set(uid, { count: getCount(uid) + 1, date
 function isPremium(member) {
   return member?.roles.cache.some(r => r.name === PREMIUM_ROLE) ?? false;
 }
+function isAdmin(member) {
+  return member?.permissions.has(PermissionFlagsBits.Administrator) ?? false;
+}
 
-function getXP(uid)  { return xpStore.get(uid) || 0; }
-function getRank(xp) { return RANKS.filter(r => xp >= r.minXP).at(-1); }
+function getXP(uid)      { return xpStore.get(uid) || 0; }
+function getRank(xp)     { return RANKS.filter(r => xp >= r.minXP).at(-1); }
 function getNextRank(xp) { return RANKS.find(r => r.minXP > xp) || null; }
 
 function getStreak(uid) { return streakStore.get(uid)?.streak || 0; }
 function bumpStreak(uid) {
   const t = today();
   const r = streakStore.get(uid);
-  if (!r)              { streakStore.set(uid, { streak: 1, lastDate: t }); return 1; }
-  if (r.lastDate === t) return r.streak;
+  if (!r)               { streakStore.set(uid, { streak: 1, lastDate: t }); return 1; }
+  if (r.lastDate === t)   return r.streak;
   const yest = new Date(); yest.setDate(yest.getDate() - 1);
-  const yStr = yest.toISOString().split('T')[0];
-  const n = r.lastDate === yStr ? r.streak + 1 : 1;
+  const n = r.lastDate === yest.toISOString().split('T')[0] ? r.streak + 1 : 1;
   streakStore.set(uid, { streak: n, lastDate: t });
   return n;
 }
@@ -84,18 +88,52 @@ function emb(title, desc, footer = null) {
   return e;
 }
 
+function modEmb(action, target, mod, reason, extra = null) {
+  const colors = { WARN: 0xF4A917, MUTE: 0xFF6B35, UNMUTE: 0x22D97A, KICK: 0xFF6B35, BAN: 0xFF0000, UNBAN: 0x22D97A, AUTOMOD: 0xFF6B35 };
+  const icons  = { WARN: '⚠️', MUTE: '🔇', UNMUTE: '🔊', KICK: '👢', BAN: '🔨', UNBAN: '✅', AUTOMOD: '🤖' };
+  const e = new EmbedBuilder()
+    .setColor(colors[action] || COLOR)
+    .setTitle(`${icons[action] || '🔨'} ${action}`)
+    .addFields(
+      { name: 'User',      value: `${target.tag || target} (${target.id || target})`, inline: true },
+      { name: 'Moderator', value: mod ? `${mod.tag} (${mod.id})` : 'AutoMod',          inline: true },
+      { name: 'Reason',    value: reason || 'No reason provided',                       inline: false },
+    )
+    .setTimestamp();
+  if (extra) e.addFields({ name: 'Details', value: extra, inline: false });
+  return e;
+}
+
+async function logMod(guild, action, target, mod, reason, extra = null) {
+  try {
+    const ch = guild.channels.cache.find(c => c.name === 'mod-logs');
+    if (ch) await ch.send({ embeds: [modEmb(action, target, mod, reason, extra)] });
+  } catch {}
+}
+
+function parseDuration(str) {
+  const m = str?.match(/^(\d+)(s|m|h|d|w)$/i);
+  if (!m) return null;
+  const mult = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
+  return Math.min(parseInt(m[1]) * mult[m[2].toLowerCase()], 28 * 86_400_000);
+}
+
+function formatDuration(ms) {
+  if (ms >= 86_400_000) return `${Math.floor(ms / 86_400_000)}d`;
+  if (ms >= 3_600_000)  return `${Math.floor(ms / 3_600_000)}h`;
+  if (ms >= 60_000)     return `${Math.floor(ms / 60_000)}m`;
+  return `${Math.floor(ms / 1000)}s`;
+}
+
 async function getMember(uid) {
   try { return await client.guilds.cache.first()?.members.fetch(uid).catch(() => null) ?? null; }
   catch { return null; }
 }
 
 async function grantXP(member, amount) {
-  const uid      = member.id;
-  const prev     = getXP(uid);
-  const prevRank = getRank(prev);
-  const next     = prev + amount;
+  const uid = member.id, prev = getXP(uid), prevRank = getRank(prev), next = prev + amount;
   xpStore.set(uid, next);
-  const newRank  = getRank(next);
+  const newRank = getRank(next);
   if (newRank.name !== prevRank.name) {
     try {
       const ch = member.guild.channels.cache.find(c => c.name === 'achievements');
@@ -117,7 +155,6 @@ Rules:
 
 FORMAT: Every single response MUST open with a short punchy one-liner (1 sentence, motivating but not cringe). Then get into content.`;
 
-// ── Prompts ───────────────────────────────────────────────────────────────────
 const P = {
   idea: i => `User interest: "${i}". Generate 3 unique business ideas for a young entrepreneur.
 For EACH idea:
@@ -169,16 +206,10 @@ async function claude(history) {
   return r.content[0].text;
 }
 
-// ── Prompt-limit check ────────────────────────────────────────────────────────
 async function checkLimit(interaction) {
-  const uid    = interaction.user.id;
-  const member = await getMember(uid);
-  const prem   = isPremium(member);
+  const uid = interaction.user.id, member = await getMember(uid), prem = isPremium(member);
   if (!prem && getCount(uid) >= DAILY_LIMIT) {
-    await interaction.reply({ embeds: [emb(
-      '⏰ Daily Limit',
-      `You've used your **${DAILY_LIMIT} daily prompts**.\n\nResets in **${timeUntilMidnight()}**.\n\nPremium = unlimited + 2x XP.\n👉 ${UPGRADE_LINK}`,
-    )] });
+    await interaction.reply({ embeds: [emb('⏰ Daily Limit', `You've used your **${DAILY_LIMIT} daily prompts**.\n\nResets in **${timeUntilMidnight()}**.\n\nPremium = unlimited + 2x XP.\n👉 ${UPGRADE_LINK}`)] });
     return null;
   }
   return { prem, member };
@@ -208,59 +239,37 @@ async function runAI(interaction, title, firstMsg) {
   }
 }
 
-// ── Command handlers ──────────────────────────────────────────────────────────
+// ── AI command handlers ───────────────────────────────────────────────────────
 async function handleHelp(ix) {
   await ix.reply({ embeds: [emb(
     '🤖 BuildrAI — All Commands',
-    `Use AI commands by **DMing me** to keep ideas private.\n\n` +
     `**AI Commands (DM only)**\n` +
-    `\`/idea\` — 3 ideas with cost + difficulty\n` +
-    `\`/pitch\` — 30-second elevator pitch\n` +
-    `\`/validate\` — score/10 + PASS/FAIL + risks\n` +
-    `\`/competitor\` — full competitor breakdown\n` +
-    `\`/landing\` — landing page copy\n` +
-    `\`/strategy\` — tailored 3-step plan\n\n` +
-    `**Info**\n` +
-    `\`/streak\` — daily usage streak\n` +
-    `\`/rank\` — your XP + rank\n` +
-    `\`/leaderboard\` — top 10 builders\n` +
-    `\`/support\` — get help\n` +
-    `\`/help\` — this menu\n\n` +
+    `\`/idea\` — 3 ideas with cost + difficulty\n\`/pitch\` — 30-second elevator pitch\n\`/validate\` — score/10 + PASS/FAIL\n\`/competitor\` — competitor breakdown\n\`/landing\` — landing page copy\n\`/strategy\` — tailored 3-step plan\n\n` +
+    `**Info**\n\`/streak\` \`/rank\` \`/leaderboard\` \`/support\` \`/help\`\n\n` +
+    `**Mod (Admin only)**\n\`/warn\` \`/warnings\` \`/clearwarns\` \`/mute\` \`/unmute\` \`/kick\` \`/ban\` \`/unban\`\n\n` +
     `**Limits:** Free = 3/day | Premium = unlimited + 2x XP\n👉 ${UPGRADE_LINK}`,
     'BuildrAI Mentor',
   )] });
 }
 
 async function handleSupport(ix) {
-  await ix.reply({ embeds: [emb(
-    '🆘 Support',
-    `For help with BuildrAI, post in **#feedback** or DM Leon directly in the server.\n\nFor payment or billing issues go to **whop.com/support**.\n\nWe respond within 24 hours.`,
-    'BuildrAI Mentor',
-  )] });
+  await ix.reply({ embeds: [emb('🆘 Support', `Post in **#feedback** or DM Leon directly.\n\nBilling issues: **whop.com/support**\n\nWe respond within 24 hours.`, 'BuildrAI Mentor')] });
 }
 
 async function handleRank(ix) {
-  const xp   = getXP(ix.user.id);
-  const rank = getRank(xp);
-  const next = getNextRank(xp);
-  await ix.reply({ embeds: [emb(
-    '/rank — Your Progress',
+  const xp = getXP(ix.user.id), rank = getRank(xp), next = getNextRank(xp);
+  await ix.reply({ embeds: [emb('/rank — Your Progress',
     `**Rank:** ${rank.name}\n**XP:** ${xp}\n\n` +
     (next ? `**${xp} / ${next.minXP} XP** to reach ${next.name}` : `**${xp} XP** — Maximum rank achieved 👑`) +
-    `\n\nEarn XP by chatting in the server. Premium = 2x XP.`,
-    'BuildrAI Mentor',
-  )] });
+    `\n\nEarn XP by chatting. Premium = 2x XP.`, 'BuildrAI Mentor')] });
 }
 
 async function handleLeaderboard(ix) {
   const entries = [...xpStore.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
-  if (!entries.length) {
-    await ix.reply({ embeds: [emb('/leaderboard', 'No XP earned yet. Start chatting in the server!')] });
-    return;
-  }
+  if (!entries.length) { await ix.reply({ embeds: [emb('/leaderboard', 'No XP yet. Start chatting!')] }); return; }
   await ix.deferReply();
   const medals = ['🥇', '🥈', '🥉'];
-  const lines  = await Promise.all(entries.map(async ([uid, xp], i) => {
+  const lines = await Promise.all(entries.map(async ([uid, xp], i) => {
     try { const u = await client.users.fetch(uid); return `${medals[i] || `${i+1}.`} **${u.username}** — ${xp} XP (${getRank(xp).name})`; }
     catch { return `${medals[i] || `${i+1}.`} Unknown — ${xp} XP`; }
   }));
@@ -269,66 +278,184 @@ async function handleLeaderboard(ix) {
 
 async function handleStreak(ix) {
   const s = getStreak(ix.user.id);
-  const msg = !s
-    ? 'No streak yet. Use your first AI command to start. 🔥'
+  const msg = !s ? 'No streak yet. Use your first AI command to start. 🔥'
     : s === 1 ? '🔥 **1 day streak.** Just started — don\'t stop now.'
-    : s < 7   ? `🔥 **${s} day streak.** Building the habit. Keep going.`
-    : s < 30  ? `🔥 **${s} day streak.** Locked in. This is how businesses get built.`
-    :           `🔥 **${s} day streak.** Elite consistency. You\'re the real deal.`;
-  await ix.reply({ embeds: [emb('/streak — Daily Usage', msg, 'BuildrAI Mentor')] });
+    : s < 7   ? `🔥 **${s} day streak.** Building the habit.`
+    : s < 30  ? `🔥 **${s} day streak.** Locked in.`
+    :           `🔥 **${s} day streak.** Elite consistency.`;
+  await ix.reply({ embeds: [emb('/streak', msg, 'BuildrAI Mentor')] });
 }
 
 async function handleValidate(ix) {
-  const lim = await checkLimit(ix);
-  if (!lim) return;
+  const lim = await checkLimit(ix); if (!lim) return;
   await ix.deferReply();
   try {
-    const idea    = ix.options.getString('idea');
+    const idea = ix.options.getString('idea');
     const history = [{ role: 'user', content: P.validateAsk(idea) }];
-    const result  = await claude(history);
+    const result = await claude(history);
     history.push({ role: 'assistant', content: result });
     conversations.set(ix.user.id, history);
-    bumpCount(ix.user.id);
-    bumpStreak(ix.user.id);
-    await ix.editReply({ embeds: [emb('/validate — Idea Validation', result + '\n\n_Reply to me in DM with all 3 answers to get your score._', footer(lim.prem, ix.user.id))] });
-  } catch (err) {
-    console.error('validate:', err.message);
-    await ix.editReply({ embeds: [emb('⚠️ Error', 'Something went wrong. Try again or use /support.')] });
-  }
+    bumpCount(ix.user.id); bumpStreak(ix.user.id);
+    await ix.editReply({ embeds: [emb('/validate — Idea Validation', result + '\n\n_Reply in DM with all 3 answers to get your score._', footer(lim.prem, ix.user.id))] });
+  } catch (err) { console.error('validate:', err.message); await ix.editReply({ embeds: [emb('⚠️ Error', 'Something went wrong. Try /support.')] }); }
 }
 
 async function handleStrategy(ix) {
-  const lim = await checkLimit(ix);
-  if (!lim) return;
+  const lim = await checkLimit(ix); if (!lim) return;
   await ix.deferReply();
   try {
-    const sit     = ix.options.getString('situation');
+    const sit = ix.options.getString('situation');
     const history = [{ role: 'user', content: P.strategyAsk(sit) }];
-    const result  = await claude(history);
+    const result = await claude(history);
     history.push({ role: 'assistant', content: result });
     conversations.set(ix.user.id, history);
-    bumpCount(ix.user.id);
-    bumpStreak(ix.user.id);
-    await ix.editReply({ embeds: [emb('/strategy — Action Plan', result + '\n\n_Reply to me in DM with your answers to get your tailored plan._', footer(lim.prem, ix.user.id))] });
-  } catch (err) {
-    console.error('strategy:', err.message);
-    await ix.editReply({ embeds: [emb('⚠️ Error', 'Something went wrong. Try again or use /support.')] });
-  }
+    bumpCount(ix.user.id); bumpStreak(ix.user.id);
+    await ix.editReply({ embeds: [emb('/strategy — Action Plan', result + '\n\n_Reply in DM with your answers to get your plan._', footer(lim.prem, ix.user.id))] });
+  } catch (err) { console.error('strategy:', err.message); await ix.editReply({ embeds: [emb('⚠️ Error', 'Something went wrong. Try /support.')] }); }
 }
 
-// ── Commands registration ─────────────────────────────────────────────────────
+// ── Mod command handlers ──────────────────────────────────────────────────────
+async function handleWarn(ix) {
+  if (!isAdmin(ix.member)) { await ix.reply({ embeds: [emb('❌ No Permission', 'Admin only.')], ephemeral: true }); return; }
+  const target = ix.options.getMember('user');
+  const reason = ix.options.getString('reason') || 'No reason provided';
+  if (!target) { await ix.reply({ embeds: [emb('❌ Error', 'User not found.')], ephemeral: true }); return; }
+
+  const warns = warnStore.get(target.id) || [];
+  warns.push({ reason, modTag: ix.user.tag, timestamp: Date.now() });
+  warnStore.set(target.id, warns);
+
+  await logMod(ix.guild, 'WARN', target.user, ix.user, reason, `Total warnings: ${warns.length}`);
+
+  // Auto-escalate
+  let autoAction = '';
+  if (warns.length === 3) {
+    try { await target.timeout(3_600_000, 'Auto: 3 warnings'); autoAction = '\n\n⚡ Auto-muted for 1 hour (3 warnings reached)'; } catch {}
+  } else if (warns.length >= 5) {
+    try { await target.kick('Auto: 5 warnings'); autoAction = '\n\n⚡ Auto-kicked (5 warnings reached)'; } catch {}
+  }
+
+  // DM the warned user
+  try { await target.send({ embeds: [emb('⚠️ Warning', `You received a warning in **${ix.guild.name}**.\n\n**Reason:** ${reason}\n\nThis is warning **#${warns.length}**. 3 warnings = auto-mute. 5 warnings = auto-kick.`)] }); } catch {}
+
+  await ix.reply({ embeds: [emb('⚠️ Warned', `**${target.user.tag}** warned.\n**Reason:** ${reason}\n**Total warnings:** ${warns.length}${autoAction}`)] });
+}
+
+async function handleWarnings(ix) {
+  if (!isAdmin(ix.member)) { await ix.reply({ embeds: [emb('❌ No Permission', 'Admin only.')], ephemeral: true }); return; }
+  const target = ix.options.getMember('user') || ix.options.getUser('user');
+  const uid = target?.id || target?.id;
+  const warns = warnStore.get(uid) || [];
+  if (!warns.length) { await ix.reply({ embeds: [emb('📋 Warnings', `No warnings for **${target?.user?.tag || target?.tag}**.`)] }); return; }
+  const list = warns.map((w, i) => `${i+1}. **${w.reason}** — by ${w.modTag} <t:${Math.floor(w.timestamp/1000)}:R>`).join('\n');
+  await ix.reply({ embeds: [emb(`📋 Warnings — ${target?.user?.tag || target?.tag}`, list)] });
+}
+
+async function handleClearwarns(ix) {
+  if (!isAdmin(ix.member)) { await ix.reply({ embeds: [emb('❌ No Permission', 'Admin only.')], ephemeral: true }); return; }
+  const target = ix.options.getMember('user');
+  warnStore.set(target.id, []);
+  await logMod(ix.guild, 'WARN', target.user, ix.user, 'Warnings cleared');
+  await ix.reply({ embeds: [emb('✅ Cleared', `All warnings cleared for **${target.user.tag}**.`)] });
+}
+
+async function handleMute(ix) {
+  if (!isAdmin(ix.member)) { await ix.reply({ embeds: [emb('❌ No Permission', 'Admin only.')], ephemeral: true }); return; }
+  const target   = ix.options.getMember('user');
+  const durStr   = ix.options.getString('duration');
+  const reason   = ix.options.getString('reason') || 'No reason provided';
+  const duration = parseDuration(durStr);
+  if (!duration) { await ix.reply({ embeds: [emb('❌ Invalid Duration', 'Use format: `10m`, `1h`, `1d`, `1w`')], ephemeral: true }); return; }
+  try {
+    await target.timeout(duration, reason);
+    await logMod(ix.guild, 'MUTE', target.user, ix.user, reason, `Duration: ${formatDuration(duration)}`);
+    try { await target.send({ embeds: [emb('🔇 Muted', `You were muted in **${ix.guild.name}** for **${formatDuration(duration)}**.\n\n**Reason:** ${reason}`)] }); } catch {}
+    await ix.reply({ embeds: [emb('🔇 Muted', `**${target.user.tag}** muted for **${formatDuration(duration)}**.\n**Reason:** ${reason}`)] });
+  } catch (err) { await ix.reply({ embeds: [emb('❌ Error', `Could not mute: ${err.message}`)], ephemeral: true }); }
+}
+
+async function handleUnmute(ix) {
+  if (!isAdmin(ix.member)) { await ix.reply({ embeds: [emb('❌ No Permission', 'Admin only.')], ephemeral: true }); return; }
+  const target = ix.options.getMember('user');
+  try {
+    await target.timeout(null);
+    await logMod(ix.guild, 'UNMUTE', target.user, ix.user, 'Timeout removed');
+    await ix.reply({ embeds: [emb('🔊 Unmuted', `**${target.user.tag}** timeout removed.`)] });
+  } catch (err) { await ix.reply({ embeds: [emb('❌ Error', `Could not unmute: ${err.message}`)], ephemeral: true }); }
+}
+
+async function handleKick(ix) {
+  if (!isAdmin(ix.member)) { await ix.reply({ embeds: [emb('❌ No Permission', 'Admin only.')], ephemeral: true }); return; }
+  const target = ix.options.getMember('user');
+  const reason = ix.options.getString('reason') || 'No reason provided';
+  try {
+    try { await target.send({ embeds: [emb('👢 Kicked', `You were kicked from **${ix.guild.name}**.\n\n**Reason:** ${reason}`)] }); } catch {}
+    await target.kick(reason);
+    await logMod(ix.guild, 'KICK', target.user, ix.user, reason);
+    await ix.reply({ embeds: [emb('👢 Kicked', `**${target.user.tag}** kicked.\n**Reason:** ${reason}`)] });
+  } catch (err) { await ix.reply({ embeds: [emb('❌ Error', `Could not kick: ${err.message}`)], ephemeral: true }); }
+}
+
+async function handleBan(ix) {
+  if (!isAdmin(ix.member)) { await ix.reply({ embeds: [emb('❌ No Permission', 'Admin only.')], ephemeral: true }); return; }
+  const target      = ix.options.getMember('user');
+  const reason      = ix.options.getString('reason') || 'No reason provided';
+  const deleteDays  = ix.options.getInteger('delete_days') || 0;
+  try {
+    try { await target.send({ embeds: [emb('🔨 Banned', `You were banned from **${ix.guild.name}**.\n\n**Reason:** ${reason}`)] }); } catch {}
+    await ix.guild.members.ban(target.id, { reason, deleteMessageDays: deleteDays });
+    await logMod(ix.guild, 'BAN', target.user, ix.user, reason, deleteDays ? `Deleted ${deleteDays} days of messages` : null);
+    await ix.reply({ embeds: [emb('🔨 Banned', `**${target.user.tag}** banned.\n**Reason:** ${reason}`)] });
+  } catch (err) { await ix.reply({ embeds: [emb('❌ Error', `Could not ban: ${err.message}`)], ephemeral: true }); }
+}
+
+async function handleUnban(ix) {
+  if (!isAdmin(ix.member)) { await ix.reply({ embeds: [emb('❌ No Permission', 'Admin only.')], ephemeral: true }); return; }
+  const userId = ix.options.getString('user_id');
+  const reason = ix.options.getString('reason') || 'No reason provided';
+  try {
+    await ix.guild.members.unban(userId, reason);
+    await logMod(ix.guild, 'UNBAN', { tag: `User ID: ${userId}`, id: userId }, ix.user, reason);
+    await ix.reply({ embeds: [emb('✅ Unbanned', `User \`${userId}\` unbanned.\n**Reason:** ${reason}`)] });
+  } catch (err) { await ix.reply({ embeds: [emb('❌ Error', `Could not unban: ${err.message}`)], ephemeral: true }); }
+}
+
+// ── Commands list ─────────────────────────────────────────────────────────────
 const commands = [
   new SlashCommandBuilder().setName('idea').setDescription('Generate 3 business ideas').addStringOption(o => o.setName('interest').setDescription('Your interest or topic').setRequired(true)),
   new SlashCommandBuilder().setName('pitch').setDescription('Write your 30-second elevator pitch').addStringOption(o => o.setName('business').setDescription('Describe your business').setRequired(true)),
   new SlashCommandBuilder().setName('validate').setDescription('Score your idea (3-question deep dive)').addStringOption(o => o.setName('idea').setDescription('Describe your idea').setRequired(true)),
   new SlashCommandBuilder().setName('competitor').setDescription('Break down a competitor or industry').addStringOption(o => o.setName('target').setDescription('Competitor name or industry').setRequired(true)),
   new SlashCommandBuilder().setName('landing').setDescription('Generate landing page copy').addStringOption(o => o.setName('product').setDescription('Describe your product or service').setRequired(true)),
-  new SlashCommandBuilder().setName('strategy').setDescription('Get a tailored 3-step action plan').addStringOption(o => o.setName('situation').setDescription('Describe your situation and biggest challenge').setRequired(true)),
+  new SlashCommandBuilder().setName('strategy').setDescription('Get a tailored 3-step action plan').addStringOption(o => o.setName('situation').setDescription('Describe your situation').setRequired(true)),
   new SlashCommandBuilder().setName('streak').setDescription('See your daily usage streak'),
   new SlashCommandBuilder().setName('rank').setDescription('See your XP and current rank'),
   new SlashCommandBuilder().setName('leaderboard').setDescription('See top 10 members by XP'),
   new SlashCommandBuilder().setName('support').setDescription('Get help with BuildrAI'),
   new SlashCommandBuilder().setName('help').setDescription('See all available commands'),
+  new SlashCommandBuilder().setName('warn').setDescription('Warn a user [Admin]')
+    .addUserOption(o => o.setName('user').setDescription('User to warn').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true)),
+  new SlashCommandBuilder().setName('warnings').setDescription('See a user\'s warnings [Admin]')
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
+  new SlashCommandBuilder().setName('clearwarns').setDescription('Clear all warnings for a user [Admin]')
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
+  new SlashCommandBuilder().setName('mute').setDescription('Timeout a user [Admin]')
+    .addUserOption(o => o.setName('user').setDescription('User to mute').setRequired(true))
+    .addStringOption(o => o.setName('duration').setDescription('Duration: 10m, 1h, 1d, 1w').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Reason')),
+  new SlashCommandBuilder().setName('unmute').setDescription('Remove timeout from a user [Admin]')
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
+  new SlashCommandBuilder().setName('kick').setDescription('Kick a user [Admin]')
+    .addUserOption(o => o.setName('user').setDescription('User to kick').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Reason')),
+  new SlashCommandBuilder().setName('ban').setDescription('Ban a user [Admin]')
+    .addUserOption(o => o.setName('user').setDescription('User to ban').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Reason'))
+    .addIntegerOption(o => o.setName('delete_days').setDescription('Days of messages to delete (0-7)').setMinValue(0).setMaxValue(7)),
+  new SlashCommandBuilder().setName('unban').setDescription('Unban a user by ID [Admin]')
+    .addStringOption(o => o.setName('user_id').setDescription('User ID to unban').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Reason')),
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -344,76 +471,93 @@ client.once(Events.ClientReady, async () => {
 });
 
 client.on(Events.GuildMemberAdd, async (member) => {
+  try { const role = member.guild.roles.cache.find(r => r.name === 'Free User'); if (role) await member.roles.add(role); } catch {}
   try {
-    const role = member.guild.roles.cache.find(r => r.name === 'Free User');
-    if (role) await member.roles.add(role);
-  } catch (err) { console.error('Free User role:', err.message); }
-
-  try {
-    await member.send({ embeds: [emb(
-      `👋 Welcome to BuildrAI, ${member.displayName}`,
-      `I'm your AI business mentor. **DM me** to keep your ideas private.\n\n` +
-      `\`/idea\` — 3 business ideas with cost + difficulty\n` +
-      `\`/pitch\` — 30-second elevator pitch\n` +
-      `\`/validate\` — score/10 + PASS/FAIL + risks\n` +
-      `\`/competitor\` — competitor breakdown\n` +
-      `\`/landing\` — landing page copy\n` +
-      `\`/strategy\` — tailored 3-step plan\n` +
-      `\`/streak\` — usage streak\n` +
-      `\`/rank\` — XP + rank\n` +
-      `\`/leaderboard\` — top 10 builders\n` +
-      `\`/support\` — get help\n\n` +
-      `**Free:** 3 prompts/day | **Premium:** unlimited + 2x XP\n👉 ${UPGRADE_LINK}\n\nLet's build something real. 🚀`,
-      'BuildrAI Mentor',
-    )] });
-  } catch { console.log(`Could not DM ${member.user.tag}`); }
+    await member.send({ embeds: [emb(`👋 Welcome to BuildrAI, ${member.displayName}`,
+      `I'm your AI business mentor. **DM me** to keep ideas private.\n\n` +
+      `\`/idea\` \`/pitch\` \`/validate\` \`/competitor\` \`/landing\` \`/strategy\`\n` +
+      `\`/streak\` \`/rank\` \`/leaderboard\` \`/support\` \`/help\`\n\n` +
+      `**Free:** 3/day | **Premium:** unlimited + 2x XP\n👉 ${UPGRADE_LINK}\n\nLet's build. 🚀`, 'BuildrAI Mentor')] });
+  } catch {}
 });
 
-// Single MessageCreate: XP (server) + DM continuation
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
 
+  // ── Server: auto-mod + XP ──────────────────────────────────────────────────
   if (message.guild) {
     const uid = message.author.id;
+    const member = message.member;
+
+    // Skip auto-mod for admins
+    if (!isAdmin(member)) {
+      // Anti-spam: 5 messages in 5 seconds
+      const now = Date.now();
+      const stamps = (spamTracker.get(uid) || []).filter(t => now - t < 5000);
+      stamps.push(now);
+      spamTracker.set(uid, stamps);
+      if (stamps.length >= 5) {
+        try {
+          await message.delete();
+          await member.timeout(300_000, 'AutoMod: spam');
+          await logMod(message.guild, 'AUTOMOD', message.author, null, 'Spam detected — 5+ messages in 5 seconds', 'Auto-muted for 5 minutes');
+          try { await message.author.send({ embeds: [emb('🤖 AutoMod', 'You were auto-muted for **5 minutes** for spamming. Slow down.')] }); } catch {}
+          spamTracker.set(uid, []);
+        } catch {}
+        return;
+      }
+
+      // Anti-invite links (discord.gg / discord.com/invite)
+      if (/discord\.(gg|com\/invite)\/\S+/i.test(message.content)) {
+        try {
+          await message.delete();
+          const warns = warnStore.get(uid) || [];
+          warns.push({ reason: 'Posted Discord invite link', modTag: 'AutoMod', timestamp: Date.now() });
+          warnStore.set(uid, warns);
+          await logMod(message.guild, 'AUTOMOD', message.author, null, 'Posted Discord invite link', `Warning #${warns.length}`);
+          await message.channel.send({ embeds: [emb('🤖 AutoMod', `${message.author} — no invite links allowed here. (**Warning #${warns.length}**)`)] }).then(m => setTimeout(() => m.delete().catch(() => {}), 5000));
+        } catch {}
+        return;
+      }
+
+      // Anti-mass-mention: 5+ unique mentions
+      const mentions = new Set([...message.mentions.users.keys(), ...message.mentions.roles.keys()]);
+      if (mentions.size >= 5) {
+        try {
+          await message.delete();
+          const warns = warnStore.get(uid) || [];
+          warns.push({ reason: 'Mass mention', modTag: 'AutoMod', timestamp: Date.now() });
+          warnStore.set(uid, warns);
+          await logMod(message.guild, 'AUTOMOD', message.author, null, `Mass mention (${mentions.size} mentions)`, `Warning #${warns.length}`);
+          try { await message.author.send({ embeds: [emb('🤖 AutoMod', `Mass mentioning isn't allowed. (**Warning #${warns.length}**)`)] }); } catch {}
+        } catch {}
+        return;
+      }
+    }
+
+    // XP
     const now = Date.now();
     if (now - (xpCooldowns.get(uid) || 0) >= XP_COOLDOWN_MS) {
       xpCooldowns.set(uid, now);
-      try {
-        const member = message.member || await message.guild.members.fetch(uid);
-        await grantXP(member, isPremium(member) ? XP_PER_MSG * 2 : XP_PER_MSG);
-      } catch (err) { console.error('XP:', err.message); }
+      try { await grantXP(member || await message.guild.members.fetch(uid), isPremium(member) ? XP_PER_MSG * 2 : XP_PER_MSG); } catch {}
     }
     return;
   }
 
-  const uid     = message.author.id;
-  const history = conversations.get(uid);
-
-  if (!history?.length) {
-    await message.reply({ embeds: [emb('👋 BuildrAI Mentor', 'Use a slash command to get started!\n\nType `/help` to see everything I can do.')] });
-    return;
-  }
-
-  const member = await getMember(uid);
-  const prem   = isPremium(member);
-  if (!prem && getCount(uid) >= DAILY_LIMIT) {
-    await message.reply({ embeds: [emb('⏰ Daily Limit', `You've used your **${DAILY_LIMIT} daily prompts**.\n\nResets in **${timeUntilMidnight()}**.\n\n👉 ${UPGRADE_LINK}`)] });
-    return;
-  }
-
+  // ── DM: conversation continuation ─────────────────────────────────────────
+  const uid = message.author.id, history = conversations.get(uid);
+  if (!history?.length) { await message.reply({ embeds: [emb('👋 BuildrAI Mentor', 'Use a slash command to start!\n\nType `/help` to see everything.')] }); return; }
+  const member = await getMember(uid), prem = isPremium(member);
+  if (!prem && getCount(uid) >= DAILY_LIMIT) { await message.reply({ embeds: [emb('⏰ Daily Limit', `Resets in **${timeUntilMidnight()}**.\n\n👉 ${UPGRADE_LINK}`)] }); return; }
   try {
-    const updated    = [...history, { role: 'user', content: message.content }];
-    const loadingMsg = await message.reply({ embeds: [emb('💭 Thinking...', 'Give me a sec...')] });
-    const result     = await claude(updated);
+    const updated = [...history, { role: 'user', content: message.content }];
+    const loading = await message.reply({ embeds: [emb('💭 Thinking...', 'Give me a sec...')] });
+    const result  = await claude(updated);
     updated.push({ role: 'assistant', content: result });
     conversations.set(uid, updated.slice(-20));
-    bumpCount(uid);
-    bumpStreak(uid);
-    await loadingMsg.edit({ embeds: [emb('BuildrAI Mentor', result, footer(prem, uid))] });
-  } catch (err) {
-    console.error('DM:', err.message);
-    await message.reply({ embeds: [emb('⚠️ Error', 'Something went wrong. Try again or use /support.')] });
-  }
+    bumpCount(uid); bumpStreak(uid);
+    await loading.edit({ embeds: [emb('BuildrAI Mentor', result, footer(prem, uid))] });
+  } catch (err) { console.error('DM:', err.message); await message.reply({ embeds: [emb('⚠️ Error', 'Something went wrong. Try again.')] }); }
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -422,26 +566,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   const aiCmds = ['idea', 'pitch', 'validate', 'competitor', 'landing', 'strategy'];
   if (aiCmds.includes(cmd) && interaction.guildId) {
-    await interaction.reply({
-      embeds: [emb('🔒 DMs Only', 'AI commands only work in DMs to keep your ideas private.\n\n**Click my username → Message** then use any command.')],
-      ephemeral: true,
-    });
+    await interaction.reply({ embeds: [emb('🔒 DMs Only', 'AI commands only work in DMs.\n\n**Click my username → Message** then use any command.')], ephemeral: true });
     return;
   }
 
   try {
     const H = {
-      help:        () => handleHelp(interaction),
-      support:     () => handleSupport(interaction),
-      rank:        () => handleRank(interaction),
-      leaderboard: () => handleLeaderboard(interaction),
-      streak:      () => handleStreak(interaction),
-      idea:        () => runAI(interaction, '/idea — Business Ideas',       P.idea(interaction.options.getString('interest'))),
-      pitch:       () => runAI(interaction, '/pitch — Elevator Pitch',      P.pitch(interaction.options.getString('business'))),
-      competitor:  () => runAI(interaction, '/competitor — Analysis',       P.competitor(interaction.options.getString('target'))),
-      landing:     () => runAI(interaction, '/landing — Landing Page Copy', P.landing(interaction.options.getString('product'))),
-      validate:    () => handleValidate(interaction),
-      strategy:    () => handleStrategy(interaction),
+      help: () => handleHelp(interaction), support: () => handleSupport(interaction),
+      rank: () => handleRank(interaction),  leaderboard: () => handleLeaderboard(interaction),
+      streak: () => handleStreak(interaction), validate: () => handleValidate(interaction),
+      strategy: () => handleStrategy(interaction),
+      idea:       () => runAI(interaction, '/idea — Business Ideas',       P.idea(interaction.options.getString('interest'))),
+      pitch:      () => runAI(interaction, '/pitch — Elevator Pitch',      P.pitch(interaction.options.getString('business'))),
+      competitor: () => runAI(interaction, '/competitor — Analysis',       P.competitor(interaction.options.getString('target'))),
+      landing:    () => runAI(interaction, '/landing — Landing Page Copy', P.landing(interaction.options.getString('product'))),
+      warn: () => handleWarn(interaction), warnings: () => handleWarnings(interaction),
+      clearwarns: () => handleClearwarns(interaction), mute: () => handleMute(interaction),
+      unmute: () => handleUnmute(interaction), kick: () => handleKick(interaction),
+      ban: () => handleBan(interaction), unban: () => handleUnban(interaction),
     };
     if (H[cmd]) await H[cmd]();
   } catch (err) {
