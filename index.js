@@ -502,8 +502,8 @@ async function handleSetupRoles(ix) {
 
   try {
     const nicheMessage =
-      `🎯 **Pick Your Niche**\n\n` +
-      `React below to get your niche role. You can pick one or more.\n\n` +
+      `🎯 Pick Your Niche\n\n` +
+      `React with an emoji below to get your niche role. You can pick more than one. Remove your reaction to remove the role.\n\n` +
       `🛍️ — E-Commerce\n` +
       `📱 — Social Media / Content\n` +
       `💻 — Tech / SaaS\n` +
