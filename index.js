@@ -197,10 +197,10 @@ Ask 2 follow-up questions to tailor your advice. Ask about the most important un
 };
 
 async function claude(history) {
-  console.log('Calling Anthropic API with model:', 'claude-3-5-haiku-20241022');
+  console.log('Calling Anthropic API with model:', 'claude-haiku-4-5-20251001');
   try {
     const r = await anthropic.messages.create({
-      model: 'claude-3-5-haiku-20241022',
+      model: 'claude-haiku-4-5-20251001',
       system: SYSTEM,
       messages: history,
       max_tokens: 800,
