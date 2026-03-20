@@ -696,8 +696,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     </div>
     <div class="section-title">🏆 XP Leaderboard</div>
     <div class="board" id="board"><div class="empty">Loading...</div></div>
-    // TODO: Replace with real Discord invite link
-    <div class="cta"><a class="btn" href="https://discord.gg/buildrai" target="_blank">Join the Server 🔨</a><a class="btn btn-premium" href="https://whop.com/buildrai/buildr-ai-premium-builder/" target="_blank">Go Premium ⚡</a></div>
+    <div class="cta"><a class="btn" href="https://discord.gg/BberczhERC" target="_blank">Join the Server 🔨</a><a class="btn btn-premium" href="https://whop.com/buildrai/buildr-ai-premium-builder/" target="_blank">Go Premium ⚡</a></div>
     <div class="refresh-note">Refreshes every 30 seconds</div>
   </div>
   <script>
