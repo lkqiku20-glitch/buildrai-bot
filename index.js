@@ -672,8 +672,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     .rank-tag { font-size: 12px; color: #666; margin-right: 20px; }
     .xp-val { font-weight: 700; color: #7B2FBE; }
     .cta { text-align: center; padding: 20px 0; }
-    .btn { display: inline-block; background: #7B2FBE; color: #fff; text-decoration: none; padding: 14px 36px; border-radius: 8px; font-weight: 600; font-size: 15px; transition: background 0.2s; }
-    .btn:hover { background: #9B4FDE; }
+    .btn { display: inline-block; color: #fff; text-decoration: none; padding: 14px 36px; border-radius: 8px; font-weight: 600; font-size: 15px; transition: background 0.2s; margin: 8px; }
+    .btn:not(.btn-premium) { background: #5865F2; }
+    .btn:not(.btn-premium):hover { background: #4752C4; }
+    .btn-premium { background: #7B2FBE; }
+    .btn-premium:hover { background: #9B4FDE; }
     .empty { padding: 48px; text-align: center; color: #555; }
     .refresh-note { text-align: center; font-size: 12px; color: #444; margin-top: 16px; }
     @media(max-width:600px){ .container{padding:20px;} .header{padding:20px;} .rank-tag{display:none;} .card-value{font-size:26px;} }
@@ -693,7 +696,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     </div>
     <div class="section-title">🏆 XP Leaderboard</div>
     <div class="board" id="board"><div class="empty">Loading...</div></div>
-    <div class="cta"><a class="btn" href="https://whop.com/buildrai/buildr-ai-premium-builder/" target="_blank">Join BuildrAI 🚀</a></div>
+    // TODO: Replace with real Discord invite link
+    <div class="cta"><a class="btn" href="https://discord.gg/buildrai" target="_blank">Join the Server 🔨</a><a class="btn btn-premium" href="https://whop.com/buildrai/buildr-ai-premium-builder/" target="_blank">Go Premium ⚡</a></div>
     <div class="refresh-note">Refreshes every 30 seconds</div>
   </div>
   <script>
