@@ -4,6 +4,8 @@ const {
   SlashCommandBuilder, Events, EmbedBuilder, PermissionFlagsBits,
 } = require('discord.js');
 const Anthropic = require('@anthropic-ai/sdk');
+const express = require('express');
+const cors = require('cors');
 
 const client = new Client({
   intents: [
@@ -39,6 +41,7 @@ const xpStore       = new Map();
 const streakStore   = new Map();
 const xpCooldowns   = new Map();
 const conversations = new Map();
+const usernameCache = new Map();
 const warnStore     = new Map(); // userId -> [{ reason, modTag, timestamp }]
 const spamTracker   = new Map(); // userId -> [timestamps]
 
@@ -136,6 +139,7 @@ async function grantXP(member, amount) {
   const prevRank = getRank(prev);
   const newXP = prev + amount;
   xpStore.set(uid, newXP);
+  if (member.user?.username) usernameCache.set(uid, member.user.username);
   const newRank = getRank(newXP);
 
   if (newRank.name !== prevRank.name) {
@@ -635,5 +639,123 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch {}
   }
 });
+
+// ── Web Dashboard ──────────────────────────────────────────
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BuildrAI — Live Dashboard</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0D0D1A; color: #fff; min-height: 100vh; }
+    .header { padding: 28px 40px; border-bottom: 1px solid #1E1E3A; display: flex; align-items: center; justify-content: space-between; }
+    .logo { font-size: 22px; font-weight: 700; color: #7B2FBE; }
+    .logo span { color: #fff; }
+    .live { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #666; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #22D97A; animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.3} }
+    .container { max-width: 1000px; margin: 0 auto; padding: 40px; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 40px; }
+    .card { background: #12122A; border: 1px solid #1E1E3A; border-radius: 12px; padding: 24px; }
+    .card-label { font-size: 12px; color: #666; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 10px; }
+    .card-value { font-size: 34px; font-weight: 700; color: #7B2FBE; }
+    .section-title { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; }
+    .board { background: #12122A; border: 1px solid #1E1E3A; border-radius: 12px; overflow: hidden; margin-bottom: 40px; }
+    .row { display: flex; align-items: center; padding: 16px 24px; border-bottom: 1px solid #1a1a30; }
+    .row:last-child { border-bottom: none; }
+    .row:hover { background: #161630; }
+    .pos { width: 36px; font-size: 18px; font-weight: 700; color: #555; }
+    .pos.gold { color: #F4A917; }
+    .name { flex: 1; font-weight: 600; font-size: 15px; }
+    .rank-tag { font-size: 12px; color: #666; margin-right: 20px; }
+    .xp-val { font-weight: 700; color: #7B2FBE; }
+    .cta { text-align: center; padding: 20px 0; }
+    .btn { display: inline-block; background: #7B2FBE; color: #fff; text-decoration: none; padding: 14px 36px; border-radius: 8px; font-weight: 600; font-size: 15px; transition: background 0.2s; }
+    .btn:hover { background: #9B4FDE; }
+    .empty { padding: 48px; text-align: center; color: #555; }
+    .refresh-note { text-align: center; font-size: 12px; color: #444; margin-top: 16px; }
+    @media(max-width:600px){ .container{padding:20px;} .header{padding:20px;} .rank-tag{display:none;} .card-value{font-size:26px;} }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="logo">Buildr<span>AI</span></div>
+    <div class="live"><div class="dot"></div>Live</div>
+  </div>
+  <div class="container">
+    <div class="stats">
+      <div class="card"><div class="card-label">Total Members</div><div class="card-value" id="memberCount">—</div></div>
+      <div class="card"><div class="card-label">Total XP Earned</div><div class="card-value" id="totalXP">—</div></div>
+      <div class="card"><div class="card-label">Active Builders</div><div class="card-value" id="activeUsers">—</div></div>
+      <div class="card"><div class="card-label">Prompts Used Today</div><div class="card-value" id="promptsToday">—</div></div>
+    </div>
+    <div class="section-title">🏆 XP Leaderboard</div>
+    <div class="board" id="board"><div class="empty">Loading...</div></div>
+    <div class="cta"><a class="btn" href="https://whop.com/buildrai/buildr-ai-premium-builder/" target="_blank">Join BuildrAI 🚀</a></div>
+    <div class="refresh-note">Refreshes every 30 seconds</div>
+  </div>
+  <script>
+    const medals = ['🥇','🥈','🥉'];
+    async function load() {
+      try {
+        const [s, l] = await Promise.all([fetch('/api/stats').then(r=>r.json()), fetch('/api/leaderboard').then(r=>r.json())]);
+        document.getElementById('memberCount').textContent = s.memberCount.toLocaleString();
+        document.getElementById('totalXP').textContent = s.totalXP.toLocaleString();
+        document.getElementById('activeUsers').textContent = s.activeUsers.toLocaleString();
+        document.getElementById('promptsToday').textContent = s.promptsToday.toLocaleString();
+        const board = document.getElementById('board');
+        if (!l.length) { board.innerHTML = '<div class="empty">No XP earned yet — start chatting in the server!</div>'; return; }
+        board.innerHTML = l.map((e,i) => \`<div class="row"><div class="pos \${i<3?'gold':''}">\${medals[i]||i+1}</div><div class="name">\${e.username}</div><div class="rank-tag">\${e.rankName}</div><div class="xp-val">\${e.xp.toLocaleString()} XP</div></div>\`).join('');
+      } catch(err) { console.error(err); }
+    }
+    load();
+    setInterval(load, 30000);
+  </script>
+</body>
+</html>`;
+
+const dashApp = express();
+dashApp.use(cors());
+
+dashApp.get('/', (req, res) => res.send(DASHBOARD_HTML));
+
+dashApp.get('/api/stats', (req, res) => {
+  try {
+    const t = today();
+    const totalXP = [...xpStore.values()].reduce((a, b) => a + b, 0);
+    const promptsToday = [...promptCounts.values()].filter(r => r.date === t).reduce((a, r) => a + r.count, 0);
+    res.json({
+      memberCount: client.guilds.cache.first()?.memberCount || 0,
+      totalXP,
+      activeUsers: xpStore.size,
+      promptsToday,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+dashApp.get('/api/leaderboard', async (req, res) => {
+  try {
+    const entries = [...xpStore.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
+    const leaderboard = await Promise.all(entries.map(async ([uid, xp], i) => {
+      let username = usernameCache.get(uid);
+      if (!username) {
+        try { const u = await client.users.fetch(uid); username = u.username; usernameCache.set(uid, username); }
+        catch { username = 'Builder'; }
+      }
+      return { rank: i + 1, username, xp, rankName: getRank(xp).name };
+    }));
+    res.json(leaderboard);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+dashApp.listen(PORT, () => console.log(`✅ Dashboard live on port ${PORT}`));
+// ── End Dashboard ──────────────────────────────────────────
 
 client.login(process.env.DISCORD_TOKEN);
