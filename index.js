@@ -1,6 +1,6 @@
 require('dotenv').config();
 const {
-  Client, GatewayIntentBits, REST, Routes,
+  Client, GatewayIntentBits, Partials, REST, Routes,
   SlashCommandBuilder, Events, EmbedBuilder, PermissionFlagsBits,
 } = require('discord.js');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -14,6 +14,12 @@ const client = new Client({
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMessageReactions,
+  ],
+  partials: [
+    Partials.Message,
+    Partials.Channel,
+    Partials.Reaction,
   ],
 });
 
@@ -44,6 +50,22 @@ const conversations = new Map();
 const usernameCache = new Map();
 const warnStore     = new Map(); // userId -> [{ reason, modTag, timestamp }]
 const spamTracker   = new Map(); // userId -> [timestamps]
+
+// ── Reaction Roles ─────────────────────────────────────────────────────────────
+let reactionRoleMessageId = null; // stored in-memory; admin runs /setuproles again after restart
+
+const NICHE_ROLES = [
+  { emoji: '🛍️', roleName: '🛍️ E-Commerce' },
+  { emoji: '📱', roleName: '📱 Social Media / Content' },
+  { emoji: '💻', roleName: '💻 Tech / SaaS' },
+  { emoji: '🎨', roleName: '🎨 Creative / Design' },
+  { emoji: '📈', roleName: '📈 Investing / Finance' },
+  { emoji: '🏪', roleName: '🏪 Local Business' },
+  { emoji: '🤝', roleName: '🤝 Service Based' },
+  { emoji: '🌱', roleName: '🌱 Still Figuring It Out' },
+];
+
+const EMOJI_TO_ROLE = new Map(NICHE_ROLES.map(({ emoji, roleName }) => [emoji, roleName]));
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function today() { return new Date().toISOString().split('T')[0]; }
@@ -459,6 +481,53 @@ async function handleUnban(ix) {
   } catch (err) { await ix.reply({ embeds: [emb('❌ Error', `Could not unban: ${err.message}`)], ephemeral: true }); }
 }
 
+// ── Reaction Role command handler ─────────────────────────────────────────────
+async function handleSetupRoles(ix) {
+  if (!ix.guild) {
+    await ix.reply({ embeds: [emb('❌ Server Only', 'This command can only be used in a server.')], ephemeral: true });
+    return;
+  }
+  if (!isAdmin(ix.member)) {
+    await ix.reply({ embeds: [emb('❌ No Permission', 'Admin only.')], ephemeral: true });
+    return;
+  }
+
+  const rolesChannel = ix.guild.channels.cache.find(c => c.name === 'roles-explained');
+  if (!rolesChannel) {
+    await ix.reply({ embeds: [emb('❌ Channel Not Found', 'Could not find a channel named **#roles-explained**. Please create it first.')], ephemeral: true });
+    return;
+  }
+
+  await ix.deferReply({ ephemeral: true });
+
+  try {
+    const nicheMessage =
+      `🎯 **Pick Your Niche**\n\n` +
+      `React below to get your niche role. You can pick one or more.\n\n` +
+      `🛍️ — E-Commerce\n` +
+      `📱 — Social Media / Content\n` +
+      `💻 — Tech / SaaS\n` +
+      `🎨 — Creative / Design\n` +
+      `📈 — Investing / Finance\n` +
+      `🏪 — Local Business\n` +
+      `🤝 — Service Based\n` +
+      `🌱 — Still Figuring It Out`;
+
+    const posted = await rolesChannel.send(nicheMessage);
+    reactionRoleMessageId = posted.id;
+
+    // Add all 8 emoji reactions sequentially so they appear in order
+    for (const { emoji } of NICHE_ROLES) {
+      try { await posted.react(emoji); } catch (err) { console.error(`Failed to react with ${emoji}:`, err.message); }
+    }
+
+    await ix.editReply({ embeds: [emb('✅ Roles Message Posted', `Niche role selection message posted in ${rolesChannel}.\n\nMessage ID: \`${posted.id}\``)] });
+  } catch (err) {
+    console.error('setuproles error:', err.message);
+    await ix.editReply({ embeds: [emb('⚠️ Error', `Failed to post roles message: ${err.message}`)] });
+  }
+}
+
 // ── Commands list ─────────────────────────────────────────────────────────────
 const commands = [
   new SlashCommandBuilder().setName('idea').setDescription('Generate 3 business ideas').addStringOption(o => o.setName('interest').setDescription('Your interest or topic').setRequired(true)),
@@ -495,6 +564,7 @@ const commands = [
   new SlashCommandBuilder().setName('unban').setDescription('Unban a user by ID [Admin]')
     .addStringOption(o => o.setName('user_id').setDescription('User ID to unban').setRequired(true))
     .addStringOption(o => o.setName('reason').setDescription('Reason')),
+  new SlashCommandBuilder().setName('setuproles').setDescription('Post the niche reaction role message in #roles-explained [Admin]'),
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -628,6 +698,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       clearwarns: () => handleClearwarns(interaction), mute: () => handleMute(interaction),
       unmute: () => handleUnmute(interaction), kick: () => handleKick(interaction),
       ban: () => handleBan(interaction), unban: () => handleUnban(interaction),
+      setuproles: () => handleSetupRoles(interaction),
     };
     if (H[cmd]) await H[cmd]();
   } catch (err) {
@@ -637,6 +708,65 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.deferred || interaction.replied) await interaction.editReply({ embeds: [e] });
       else await interaction.reply({ embeds: [e], ephemeral: true });
     } catch {}
+  }
+});
+
+// ── Reaction Role Events ───────────────────────────────────────────────────────
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  try {
+    if (user.bot) return;
+    if (!reactionRoleMessageId || reaction.message.id !== reactionRoleMessageId) return;
+
+    // Fetch partial data if needed
+    if (reaction.partial) { try { await reaction.fetch(); } catch (err) { console.error('Failed to fetch reaction:', err.message); return; } }
+    if (reaction.message.partial) { try { await reaction.message.fetch(); } catch (err) { console.error('Failed to fetch message:', err.message); return; } }
+
+    const emoji = reaction.emoji.name;
+    const roleName = EMOJI_TO_ROLE.get(emoji);
+    if (!roleName) return;
+
+    const guild = reaction.message.guild;
+    if (!guild) return;
+
+    const member = await guild.members.fetch(user.id).catch(() => null);
+    if (!member) return;
+
+    const role = guild.roles.cache.find(r => r.name === roleName);
+    if (!role) { console.error(`Reaction role not found in server: "${roleName}"`); return; }
+
+    await member.roles.add(role);
+    console.log(`Added role "${roleName}" to ${user.tag}`);
+  } catch (err) {
+    console.error('MessageReactionAdd error:', err.message);
+  }
+});
+
+client.on(Events.MessageReactionRemove, async (reaction, user) => {
+  try {
+    if (user.bot) return;
+    if (!reactionRoleMessageId || reaction.message.id !== reactionRoleMessageId) return;
+
+    // Fetch partial data if needed
+    if (reaction.partial) { try { await reaction.fetch(); } catch (err) { console.error('Failed to fetch reaction:', err.message); return; } }
+    if (reaction.message.partial) { try { await reaction.message.fetch(); } catch (err) { console.error('Failed to fetch message:', err.message); return; } }
+
+    const emoji = reaction.emoji.name;
+    const roleName = EMOJI_TO_ROLE.get(emoji);
+    if (!roleName) return;
+
+    const guild = reaction.message.guild;
+    if (!guild) return;
+
+    const member = await guild.members.fetch(user.id).catch(() => null);
+    if (!member) return;
+
+    const role = guild.roles.cache.find(r => r.name === roleName);
+    if (!role) { console.error(`Reaction role not found in server: "${roleName}"`); return; }
+
+    await member.roles.remove(role);
+    console.log(`Removed role "${roleName}" from ${user.tag}`);
+  } catch (err) {
+    console.error('MessageReactionRemove error:', err.message);
   }
 });
 
