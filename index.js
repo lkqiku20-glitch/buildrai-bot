@@ -131,14 +131,43 @@ async function getMember(uid) {
 }
 
 async function grantXP(member, amount) {
-  const uid = member.id, prev = getXP(uid), prevRank = getRank(prev), next = prev + amount;
-  xpStore.set(uid, next);
-  const newRank = getRank(next);
+  const uid = member.id;
+  const prev = getXP(uid);
+  const prevRank = getRank(prev);
+  const newXP = prev + amount;
+  xpStore.set(uid, newXP);
+  const newRank = getRank(newXP);
+
   if (newRank.name !== prevRank.name) {
+    // Post to #achievements
     try {
       const ch = member.guild.channels.cache.find(c => c.name === 'achievements');
-      if (ch) await ch.send({ embeds: [emb('🎉 Rank Up!', `**${member.displayName}** just hit **${newRank.name}** with **${next} XP**! 🚀`)] });
-    } catch {}
+      if (ch) await ch.send({ embeds: [emb('🎉 Rank Up!', `**${member.displayName}** just reached **${newRank.name}** with **${newXP} XP**! 🚀`)] });
+    } catch (err) {
+      console.error('Achievements post error:', err.message);
+    }
+
+    // Remove old rank role, assign new rank role
+    try {
+      const rankNames = ['🌱 Rookie', '🔨 Builder', '⚙️ Operator', '🤝 Closer', '🚀 Founder', '👑 Empire'];
+      // Remove all existing rank roles
+      for (const rankName of rankNames) {
+        const existingRole = member.guild.roles.cache.find(r => r.name === rankName);
+        if (existingRole && member.roles.cache.has(existingRole.id)) {
+          await member.roles.remove(existingRole);
+        }
+      }
+      // Add new rank role
+      const newRankRole = member.guild.roles.cache.find(r => r.name === newRank.name);
+      if (newRankRole) {
+        await member.roles.add(newRankRole);
+        console.log(`Assigned ${newRank.name} to ${member.displayName}`);
+      } else {
+        console.log(`Role not found for rank: ${newRank.name}`);
+      }
+    } catch (err) {
+      console.error('Role assignment error:', err.message);
+    }
   }
 }
 
@@ -478,6 +507,11 @@ client.once(Events.ClientReady, async () => {
 
 client.on(Events.GuildMemberAdd, async (member) => {
   try { const role = member.guild.roles.cache.find(r => r.name === 'Free User'); if (role) await member.roles.add(role); } catch {}
+  // Assign starting rank role
+  try {
+    const rookieRole = member.guild.roles.cache.find(r => r.name === '🌱 Rookie');
+    if (rookieRole) await member.roles.add(rookieRole);
+  } catch {}
   try {
     await member.send({ embeds: [emb(`👋 Welcome to BuildrAI, ${member.displayName}`,
       `I'm your AI business mentor. **DM me** to keep ideas private.\n\n` +
