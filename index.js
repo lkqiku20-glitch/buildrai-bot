@@ -197,13 +197,19 @@ Ask 2 follow-up questions to tailor your advice. Ask about the most important un
 };
 
 async function claude(history) {
-  const r = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    system: SYSTEM,
-    messages: history,
-    max_tokens: 800,
-  });
-  return r.content[0].text;
+  console.log('Calling Anthropic API with model:', 'claude-3-5-haiku-20241022');
+  try {
+    const r = await anthropic.messages.create({
+      model: 'claude-3-5-haiku-20241022',
+      system: SYSTEM,
+      messages: history,
+      max_tokens: 800,
+    });
+    return r.content[0].text;
+  } catch (err) {
+    console.error('Anthropic API error — status:', err.status, '| message:', err.message, '| error:', err.error ?? null);
+    throw err;
+  }
 }
 
 async function checkLimit(interaction) {
@@ -557,7 +563,7 @@ client.on(Events.MessageCreate, async (message) => {
     conversations.set(uid, updated.slice(-20));
     bumpCount(uid); bumpStreak(uid);
     await loading.edit({ embeds: [emb('BuildrAI Mentor', result, footer(prem, uid))] });
-  } catch (err) { console.error('DM:', err.message); await message.reply({ embeds: [emb('⚠️ Error', 'Something went wrong. Try again.')] }); }
+  } catch (err) { console.error('DM conversation failed:', err); await message.reply({ embeds: [emb('⚠️ Error', 'Something went wrong. Try again.')] }); }
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -587,7 +593,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     };
     if (H[cmd]) await H[cmd]();
   } catch (err) {
-    console.error(`${cmd}:`, err.message);
+    console.error(`Command ${cmd} failed:`, err);
     try {
       const e = emb('⚠️ Error', 'Something went wrong. Try again or use `/support`.');
       if (interaction.deferred || interaction.replied) await interaction.editReply({ embeds: [e] });
